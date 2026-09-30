@@ -1,0 +1,186 @@
+"""
+VERI-DRIVE: Automated Vehicle Health Scanner - Single File Application
+Combines Training, Inference, and API endpoints[cite: 3].
+"""
+
+import sys
+import uuid
+import cv2
+import numpy as np
+from datetime import datetime, timezone
+from typing import Any, Dict, List
+from ultralytics import YOLO
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+import uvicorn
+
+# ==========================================
+# 1. CONFIGURATION & MAPPINGS
+# ==========================================
+
+# Hyperparameter configuration matching system specification[cite: 3]
+TRAINING_CONFIG = {
+    "model": "yolov8m.pt",
+    "data": "config/dataset.yaml",  # Ensure this file exists if training
+    "epochs": 100,
+    "imgsz": 640,
+    "batch": 16,
+    "optimizer": "AdamW",
+    "lr0": 0.001,
+    "lrf": 0.01,
+    "warmup_epochs": 3.0,
+    "patience": 15,
+    "device": 0,
+    "project": "runs/train",
+    "name": "veri_drive_yolov8m",
+}
+
+ACTION_RECOMMENDATIONS = {
+    "rust": "Apply anti-rust coating; inspect structural floor pan.",
+    "thermal_overheat": "Inspect front-right brake caliper for sticking or severe pad wear.",
+    "scratch": "Cosmetic clear-coat buffing or touch-up paint required.",
+    "dent": "Perform paintless dent repair (PDR) assessment.",
+    "tire_wear": "Check wheel alignment and schedule tire replacement.",
+    "oil_leak": "Inspect gasket seals and fluid pressure immediately.",
+    "cracked_glass": "Replace windshield panel to maintain structural safety integrity.",
+}
+
+# ==========================================
+# 2. INFERENCE ENGINE
+# ==========================================
+
+def compute_severity(class_name: str, confidence: float) -> str:
+    high_priority = {"thermal_overheat", "oil_leak", "cracked_glass"}
+    if class_name in high_priority:
+        return "High" if confidence > 0.70 else "Medium"
+    return "Medium" if confidence > 0.75 else "Low"
+
+
+class VeriDriveInferenceEngine:
+    def __init__(self, weights_path: str = "yolov8m.pt", conf_threshold: float = 0.25, iou_threshold: float = 0.45):
+        self.model = YOLO(weights_path)
+        self.conf = conf_threshold
+        self.iou = iou_threshold
+
+    def inspect_feed(self, image_input: np.ndarray, sensor_id: str = "RGB_Camera_Left_Underchassis", inspection_id: str | None = None) -> Dict[str, Any]:
+        if inspection_id is None:
+            inspection_id = f"SIH-2026-INSP-{uuid.uuid4().hex[:4].upper()}"
+
+        results = self.model.predict(
+            source=image_input,
+            conf=self.conf,
+            iou=self.iou,
+            imgsz=640,
+            verbose=False,
+        )
+
+        detected_defects: List[Dict[str, Any]] = []
+
+        for r in results:
+            boxes = r.boxes
+            for idx, box in enumerate(boxes):
+                cls_id = int(box.cls[0].item())
+                class_name = self.model.names[cls_id]
+                conf = round(float(box.conf[0].item()), 2)
+                xyxy = [int(coord) for coord in box.xyxy[0].tolist()]
+
+                defect_entry = {
+                    "defect_id": f"DEF-{idx + 1:02d}",
+                    "class": class_name,
+                    "confidence": conf,
+                    "severity": compute_severity(class_name, conf),
+                    "source_sensor": sensor_id,
+                    "bounding_box": xyxy,
+                    "recommended_action": ACTION_RECOMMENDATIONS.get(
+                        class_name, "Standard maintenance inspection required."
+                    ),
+                }
+                detected_defects.append(defect_entry)
+
+        payload = {
+            "inspection_id": inspection_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+            "defects_detected": detected_defects,
+        }
+        return payload
+
+# ==========================================
+# 3. FASTAPI SERVICE ENDPOINTS
+# ==========================================
+
+app = FastAPI(
+    title="VERI-DRIVE Multi-Modal Inspection API",
+    version="1.0.0",
+    description="Automated & Contact-Less Drive-Through Vehicle Inspection Pipeline[cite: 3]",
+)
+
+INSPECTION_REPORTS_DB: Dict[str, Dict[str, Any]] = {}
+engine = VeriDriveInferenceEngine(weights_path="yolov8m.pt")
+
+@app.get("/api/v1/models/status")
+async def get_models_status():
+    return {
+        "status": "online",
+        "active_model": "YOLOv8m",
+        "precision_mode": "FP32",
+        "target_latency_ms": 35.0,
+        "supported_sensors": ["RGB", "Thermal_LWIR", "Depth_3D"],
+    }
+
+@app.post("/api/v1/inspect")
+async def inspect_vehicle(
+    sensor_id: str = Form("RGB_Camera_Left_Underchassis"),
+    inspection_id: str | None = Form(None),
+    file: UploadFile = File(...),
+):
+    contents = await file.read()
+    np_arr = np.frombuffer(contents, np.uint8)
+    frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+
+    if frame is None:
+        raise HTTPException(status_code=400, detail="Invalid image payload received.")
+
+    report = engine.inspect_feed(image_input=frame, sensor_id=sensor_id, inspection_id=inspection_id)
+    INSPECTION_REPORTS_DB[report["inspection_id"]] = report
+    return report
+
+@app.get("/api/v1/report/{inspection_id}")
+async def get_inspection_report(inspection_id: str):
+    if inspection_id not in INSPECTION_REPORTS_DB:
+        raise HTTPException(status_code=404, detail=f"Inspection report {inspection_id} not found.")
+    return INSPECTION_REPORTS_DB[inspection_id]
+
+# ==========================================
+# 4. TRAINING PIPELINE
+# ==========================================
+
+def run_training():
+    model = YOLO(TRAINING_CONFIG["model"])
+    results = model.train(
+        data=TRAINING_CONFIG["data"],
+        epochs=TRAINING_CONFIG["epochs"],
+        imgsz=TRAINING_CONFIG["imgsz"],
+        batch=TRAINING_CONFIG["batch"],
+        optimizer=TRAINING_CONFIG["optimizer"],
+        lr0=TRAINING_CONFIG["lr0"],
+        lrf=TRAINING_CONFIG["lrf"],
+        warmup_epochs=TRAINING_CONFIG["warmup_epochs"],
+        patience=TRAINING_CONFIG["patience"],
+        project=TRAINING_CONFIG["project"],
+        name=TRAINING_CONFIG["name"],
+    )
+    metrics = model.val()
+    print(f"Validation mAP@50: {metrics.box.map50:.4f}")
+    print(f"Validation mAP@50-95: {metrics.box.map:.4f}")
+
+# ==========================================
+# 5. EXECUTION ENTRY POINT
+# ==========================================
+
+if __name__ == "__main__":
+    # Run API server by default, or run training if 'train' argument is passed
+    if len(sys.argv) > 1 and sys.argv[1].lower() == "train":
+        print("Starting VERI-DRIVE YOLOv8 Training Pipeline...")
+        run_training()
+    else:
+        print("Starting VERI-DRIVE API Server...")
+        uvicorn.run(app, host="0.0.0.0", port=8000)
